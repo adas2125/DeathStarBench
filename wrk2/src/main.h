@@ -33,6 +33,7 @@ static int reconnect_socket(thread *, connection *);
 
 static int calibrate(aeEventLoop *, long long, void *);
 static int sample_rate(aeEventLoop *, long long, void *);
+static int report_attempted_requests(aeEventLoop *, long long, void *);
 static int delayed_initial_connect(aeEventLoop *, long long, void *);
 static int check_timeouts(aeEventLoop *, long long, void *);
 

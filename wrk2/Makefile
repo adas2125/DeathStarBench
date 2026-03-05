@@ -7,7 +7,18 @@ ifeq ($(TARGET), sunos)
 	CFLAGS += -D_PTHREADS -D_POSIX_C_SOURCE=200112L
 	LIBS   += -lsocket
 else ifeq ($(TARGET), darwin)
-	LDFLAGS += -pagezero_size 10000 -image_base 100000000
+	# LuaJIT's macOS build expects this to be set. Default to host major.minor.
+	MACOSX_DEPLOYMENT_TARGET ?= $(shell sw_vers -productVersion 2>/dev/null | awk -F. '{print $$1 "." $$2}')
+	export MACOSX_DEPLOYMENT_TARGET
+	# Prefer Homebrew OpenSSL locations on Apple Silicon and Intel Macs.
+	OPENSSL_PREFIX ?= $(shell \
+		if [ -d /opt/homebrew/opt/openssl@3 ]; then echo /opt/homebrew/opt/openssl@3; \
+		elif [ -d /usr/local/opt/openssl@3 ]; then echo /usr/local/opt/openssl@3; \
+		fi)
+ifneq ($(OPENSSL_PREFIX),)
+	CFLAGS  += -I$(OPENSSL_PREFIX)/include
+	LDFLAGS += -L$(OPENSSL_PREFIX)/lib
+endif
 else ifeq ($(TARGET), linux)
         CFLAGS  += -D_POSIX_C_SOURCE=200112L -D_BSD_SOURCE
 	LIBS    += -ldl
@@ -22,11 +33,12 @@ SRC  := wrk.c net.c ssl.c aprintf.c stats.c script.c units.c \
 BIN  := wrk
 
 ODIR := obj
-OBJ  := $(patsubst %.c,$(ODIR)/%.o,$(SRC)) $(ODIR)/bytecode.o
+OBJ  := $(patsubst %.c,$(ODIR)/%.o,$(SRC))
 
 LDIR     = deps/luajit/src
 LIBS    := -lluajit $(LIBS)
 CFLAGS  += -I$(LDIR)
+CFLAGS  += -DWRK_LUA_PATH='"$(CURDIR)/src/wrk.lua"'
 LDFLAGS += -L$(LDIR)
 
 all: $(BIN)
@@ -34,6 +46,9 @@ all: $(BIN)
 clean:
 	$(RM) $(BIN) obj/*
 	@$(MAKE) -C deps/luajit clean
+	rm -f attempted_requests.txt arrivals.csv
+	rm -rf output/
+	rm sweep.log sweep.pid
 
 $(BIN): $(OBJ)
 	@echo LINK $(BIN)
@@ -43,10 +58,6 @@ $(OBJ): config.h Makefile $(LDIR)/libluajit.a | $(ODIR)
 
 $(ODIR):
 	@mkdir -p $@
-
-$(ODIR)/bytecode.o: src/wrk.lua
-	@echo LUAJIT $<
-	@$(SHELL) -c 'cd $(LDIR) && ./luajit -b $(CURDIR)/$< $(CURDIR)/$@'
 
 $(ODIR)/%.o : %.c
 	@echo CC $<

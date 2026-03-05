@@ -7,6 +7,12 @@
 #include "hdr_histogram.h"
 #include "stats.h"
 #include "assert.h"
+#include <stdio.h>
+#include <inttypes.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
 
 // Max recordable latency of 1 day
 #define MAX_LATENCY 24L * 60 * 60 * 1000000
@@ -29,6 +35,7 @@ static struct config {
     bool     record_all_responses;
     bool     print_all_responses;
     bool     print_realtime_latency;
+    bool     save_csv_metrics;
     char    *script;
     SSL_CTX *ctx; //https://www.openssl.org/docs/man3.0/man3/SSL_CTX_new.html
 } cfg;
@@ -52,6 +59,22 @@ static struct http_parser_settings parser_settings = {
 };
 
 static volatile sig_atomic_t stop = 0;
+static thread *all_threads = NULL;
+static uint64_t all_num_threads = 0;
+static const char attempted_requests_filename[] = "attempted_requests.csv";
+static FILE *attempted_requests_file = NULL;
+static FILE *metrics_csv_file = NULL;
+static char metrics_csv_filename[256] = {0};
+
+static const char *dist_name(int dist) {
+    switch (dist) {
+        case 0: return "fixed";
+        case 1: return "exp";
+        case 2: return "norm";
+        case 3: return "zipf";
+        default: return "unknown";
+    }
+}
 
 static void handler(int sig) {
     stop = 1;
@@ -65,6 +88,7 @@ static void usage() {
            "    -P                     Print each request's latency          \n"
            "    -p                     Print 99th latency every 0.2s to file \n"
            "                           under the current working directory   \n"
+           "    -C, --csv              Save printed summary metrics to CSV    \n"
            "    -d, --duration    <T>  Duration of test                      \n"
            "    -t, --threads     <N>  Number of threads to use              \n"
            "                                                                 \n"
@@ -76,7 +100,7 @@ static void usage() {
            "    -B, --batch_latency    Measure latency of whole              \n"
            "                           batches of pipelined ops              \n"
            "                           (as opposed to each op)               \n"
-           "    -r, --requests         Show the number of sent requests      \n"
+           "    -r, --requests         Show the number of sent requests      \n" // reports actual fully written requests, not mere attempts.
            "    -v, --version          Print version details                 \n"
            "    -R, --rate        <T>  work rate (throughput)                \n"
            "                           in requests/sec (total)               \n"
@@ -99,7 +123,52 @@ int main(int argc, char **argv) {
         exit(1);
     }
 
+    if (cfg.save_csv_metrics) {
+        // create output directory if it doesn't exist
+        if (mkdir("output", 0777) == -1 && errno != EEXIST) {
+            fprintf(stderr, "Failed to create output directory: %s\n", strerror(errno));
+            return AE_NOMORE;
+        }
+
+        snprintf(metrics_csv_filename, sizeof(metrics_csv_filename),
+                 "output/metrics_rps%" PRIu64 "_conn%" PRIu64 "_dur%" PRIu64 "s_dist%s.csv",
+                 cfg.rate, cfg.connections, cfg.duration, dist_name(cfg.dist));
+        metrics_csv_file = fopen(metrics_csv_filename, "w");
+        if (metrics_csv_file == NULL) {
+            fprintf(stderr, "Failed to open %s for writing: %s\n",
+                    metrics_csv_filename, strerror(errno));
+            return AE_NOMORE;
+        }
+        fprintf(metrics_csv_file,
+                "scope,url,requests,runtime_us,req_per_s,bytes,bytes_per_s,"
+                "send_delay_avg_us,send_delay_p99_us,latency_p50_us,latency_p99_us,"
+                "in_flight_current,in_flight_peak,write_timeouts,socket_write_failures\n");
+        fflush(metrics_csv_file);
+        printf("Saving summary metrics to %s\n", metrics_csv_filename);
+    }
+
+    // add start time to the filename of attempted_requests.csv
+    FILE *f = fopen(attempted_requests_filename, "a");
+    if (f == NULL) {
+        fprintf(stderr, "Failed to open %s for writing: %s\n",
+                attempted_requests_filename, strerror(errno));
+        return AE_NOMORE;
+    }
+    attempted_requests_file = f;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    // file empty, so we write the header
+    if (size == 0) {
+        fprintf(f, "timestamp,attempted\n");
+        fflush(f);
+    }
+    // add first timestamp, 0
+    fprintf(f, "%" PRIu64 ",0\n", time_us());
+    fflush(f);
+
     thread *threads = zcalloc(cfg.num_urls * cfg.threads * sizeof(thread));
+    all_threads = threads;
+    all_num_threads = cfg.num_urls * cfg.threads;
     uint64_t connections = cfg.connections / cfg.threads;
     uint64_t throughput = cfg.rate / cfg.threads;
     char *time = format_time_s(cfg.duration);
@@ -112,14 +181,20 @@ int main(int argc, char **argv) {
     struct hdr_histogram* total_latency_histogram;
     struct hdr_histogram* total_real_latency_histogram;
     struct hdr_histogram* total_request_histogram;
+    struct hdr_histogram* total_send_delay_histogram;
 
     hdr_init(1, MAX_LATENCY, 3, &total_latency_histogram);
     hdr_init(1, MAX_LATENCY, 3, &total_real_latency_histogram);
     hdr_init(1, MAX_LATENCY, 3, &total_request_histogram);
+    hdr_init(1, MAX_LATENCY, 3, &total_send_delay_histogram);
     
     uint64_t *runtime_us = zcalloc(cfg.num_urls * sizeof(uint64_t));
     uint64_t total_complete  = 0;
     uint64_t total_bytes     = 0;
+    uint64_t total_write_timeouts = 0;
+    uint64_t total_socket_write_failures = 0;
+    uint64_t total_in_flight = 0;
+    uint64_t total_peak_in_flight = 0;
     uint64_t sent_requests[cfg.num_urls];
     uint64_t total_sent_requests  = 0;
     uint64_t start_urls[cfg.num_urls];
@@ -179,9 +254,13 @@ int main(int argc, char **argv) {
             t->stop_at       = stop_at;
             t->complete      = 0;
             t->sent          = 0;
+            t->attempted     = 0;
             t->monitored     = 0;
             t->target        = throughput/10; //Shuang
             t->accum_latency = 0;
+            t->in_flight     = 0;
+            t->peak_in_flight = 0;
+            t->write_timeouts = 0;
             t->L = script_create(cfg.script, url, headers);
             script_init(L[id_url], t, argc - optind, &argv[optind]);
 
@@ -209,7 +288,7 @@ int main(int argc, char **argv) {
         start_urls[id_url] = time_us();
 
     }
-    
+
     struct sigaction sa = {
         .sa_handler = handler,
         .sa_flags   = 0,
@@ -232,7 +311,7 @@ int main(int argc, char **argv) {
         // timer
         runtime_us[id_url] = time_us() -start_urls[id_url];
     }
-    
+
     uint64_t end = time_us();
     uint64_t total_runtime_us = end - start_urls[0];
 
@@ -250,8 +329,14 @@ int main(int argc, char **argv) {
         // init 2 histograms with MAX_LATENCY
         struct hdr_histogram* latency_histogram;
         struct hdr_histogram* real_latency_histogram;
+        struct hdr_histogram* send_delay_histogram;
         hdr_init(1, MAX_LATENCY, 3, &latency_histogram);
         hdr_init(1, MAX_LATENCY, 3, &real_latency_histogram);
+        hdr_init(1, MAX_LATENCY, 3, &send_delay_histogram);
+        uint64_t write_timeouts = 0;
+        uint64_t socket_write_failures = 0;
+        uint64_t in_flight = 0;
+        uint64_t peak_in_flight = 0;
         for (uint64_t id_thread = 0; id_thread < cfg.threads; id_thread++) {
             uint64_t i = id_url*cfg.threads+id_thread;
             thread *t = &threads[i];
@@ -263,9 +348,14 @@ int main(int argc, char **argv) {
             errors.write   += t->errors.write;
             errors.timeout += t->errors.timeout;
             errors.status  += t->errors.status;
+            write_timeouts += t->write_timeouts;
+            socket_write_failures += t->errors.write;
+            in_flight += t->in_flight;
+            peak_in_flight += t->peak_in_flight;
 
             hdr_add(latency_histogram, t->latency_histogram);
             hdr_add(real_latency_histogram, t->real_latency_histogram);
+            hdr_add(send_delay_histogram, t->send_delay_histogram);
             if (cfg.print_all_responses) {
                 char filename[10] = {0};
                 sprintf(filename, "%" PRIu64 ".txt", i);
@@ -313,6 +403,7 @@ int main(int argc, char **argv) {
 
             printf("  %"PRIu64" requests in %s, %sB read\n",
                 complete, runtime_msg, format_binary(bytes));
+            free(runtime_msg);
             if (errors.connect || errors.read || errors.write || errors.timeout) {
                 printf("  Socket errors: connect %d, read %d, write %d, timeout %d\n",
                     errors.connect, errors.read, errors.write, errors.timeout);
@@ -324,6 +415,35 @@ int main(int argc, char **argv) {
 
             printf("Requests/sec: %9.2Lf  \n", req_per_s);
             printf("Transfer/sec: %10sB\n", format_binary(bytes_per_s));
+            long double avg_send_delay_us = hdr_mean(send_delay_histogram);
+            int64_t p99_send_delay_us = hdr_value_at_percentile(send_delay_histogram, 99.0);
+            char *avg_send_delay_msg = format_time_us(avg_send_delay_us);
+            char *p99_send_delay_msg = format_time_us(p99_send_delay_us);
+            printf("Client send delay avg/p99: %8s / %8s\n",
+                avg_send_delay_msg, p99_send_delay_msg);
+            free(avg_send_delay_msg);
+            free(p99_send_delay_msg);
+            int64_t p50_latency_us = hdr_value_at_percentile(latency_histogram, 50.0);
+            int64_t p99_latency_us = hdr_value_at_percentile(latency_histogram, 99.0);
+            char *p50_latency_msg = format_time_us(p50_latency_us);
+            char *p99_latency_msg = format_time_us(p99_latency_us);
+            printf("Latency p50/p99: %8s / %8s\n",
+                p50_latency_msg, p99_latency_msg);
+            free(p50_latency_msg);
+            free(p99_latency_msg);
+            printf("In-flight: current %" PRIu64 ", peak %" PRIu64 "\n", in_flight, peak_in_flight);
+            printf("Client write issues: timeouts %" PRIu64 ", socket write failures %" PRIu64 "\n",
+                write_timeouts, socket_write_failures);
+            if (cfg.save_csv_metrics && metrics_csv_file) {
+                fprintf(metrics_csv_file,
+                        "url,\"%s\",%" PRIu64 ",%" PRIu64 ",%.9Lf,%" PRIu64 ",%.9Lf,"
+                        "%.3Lf,%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRIu64 ",%" PRIu64
+                        ",%" PRIu64 ",%" PRIu64 "\n",
+                        url, complete, runtime_us[id_url], req_per_s, bytes, bytes_per_s,
+                        avg_send_delay_us, p99_send_delay_us, p50_latency_us, p99_latency_us,
+                        in_flight, peak_in_flight, write_timeouts, socket_write_failures);
+                fflush(metrics_csv_file);
+            }
 
             if (script_has_done(L[id_url])) {
                 script_summary(L[id_url], runtime_us[id_url], complete, bytes);
@@ -337,9 +457,14 @@ int main(int argc, char **argv) {
         }
         total_complete += complete;
         total_bytes += bytes;
+        total_write_timeouts += write_timeouts;
+        total_socket_write_failures += socket_write_failures;
+        total_in_flight += in_flight;
+        total_peak_in_flight += peak_in_flight;
         hdr_add(total_latency_histogram, latency_histogram);
         hdr_add(total_real_latency_histogram, real_latency_histogram);
         hdr_add(total_request_histogram, (statistics.requests[id_url])->histogram);
+        hdr_add(total_send_delay_histogram, send_delay_histogram);
                 
     }
 
@@ -374,9 +499,49 @@ int main(int argc, char **argv) {
         char *total_runtime_msg = format_time_us(total_runtime_us);
 
         printf("  Overall %"PRIu64" requests in %s, %sB read\n", total_complete, total_runtime_msg, format_binary(total_bytes));
+        free(total_runtime_msg);
 
         printf("Requests/sec: %9.2Lf\n", total_req_per_s);
         printf("Transfer/sec: %10sB\n", format_binary(total_bytes_per_s));
+        long double overall_avg_send_delay_us = hdr_mean(total_send_delay_histogram);
+        int64_t overall_p99_send_delay_us = hdr_value_at_percentile(total_send_delay_histogram, 99.0);
+        char *overall_avg_send_delay_msg = format_time_us(overall_avg_send_delay_us);
+        char *overall_p99_send_delay_msg = format_time_us(overall_p99_send_delay_us);
+        printf("Client send delay avg/p99: %8s / %8s\n",
+            overall_avg_send_delay_msg, overall_p99_send_delay_msg);
+        free(overall_avg_send_delay_msg);
+        free(overall_p99_send_delay_msg);
+        int64_t overall_p50_latency_us = hdr_value_at_percentile(total_latency_histogram, 50.0);
+        int64_t overall_p99_latency_us = hdr_value_at_percentile(total_latency_histogram, 99.0);
+        char *overall_p50_latency_msg = format_time_us(overall_p50_latency_us);
+        char *overall_p99_latency_msg = format_time_us(overall_p99_latency_us);
+        printf("Latency p50/p99: %8s / %8s\n",
+            overall_p50_latency_msg, overall_p99_latency_msg);
+        free(overall_p50_latency_msg);
+        free(overall_p99_latency_msg);
+        printf("In-flight: current %" PRIu64 ", peak %" PRIu64 "\n", total_in_flight, total_peak_in_flight);
+        printf("Client write issues: timeouts %" PRIu64 ", socket write failures %" PRIu64 "\n",
+            total_write_timeouts, total_socket_write_failures);
+        if (cfg.save_csv_metrics && metrics_csv_file) {
+            fprintf(metrics_csv_file,
+                    "overall,ALL,%" PRIu64 ",%" PRIu64 ",%.9Lf,%" PRIu64 ",%.9Lf,"
+                    "%.3Lf,%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRIu64 ",%" PRIu64
+                    ",%" PRIu64 ",%" PRIu64 "\n",
+                    total_complete, total_runtime_us, total_req_per_s, total_bytes, total_bytes_per_s,
+                    overall_avg_send_delay_us, overall_p99_send_delay_us,
+                    overall_p50_latency_us, overall_p99_latency_us,
+                    total_in_flight, total_peak_in_flight, total_write_timeouts, total_socket_write_failures);
+            fflush(metrics_csv_file);
+        }
+    }
+    // closing the attempted_requests_file if it was opened
+    if (attempted_requests_file) {
+        fclose(attempted_requests_file);
+        attempted_requests_file = NULL;
+    }
+    if (metrics_csv_file) {
+        fclose(metrics_csv_file);
+        metrics_csv_file = NULL;
     }
     return 0;
 }
@@ -390,6 +555,7 @@ void *thread_main(void *arg) {
     tinymt64_init(&thread->rand, time_us());
     hdr_init(1, MAX_LATENCY, 3, &thread->latency_histogram);
     hdr_init(1, MAX_LATENCY, 3, &thread->real_latency_histogram);
+    hdr_init(1, MAX_LATENCY, 3, &thread->send_delay_histogram);
 
     char *request = NULL;
     size_t length = 0;
@@ -423,6 +589,8 @@ void *thread_main(void *arg) {
         c->complete   = 0;
         c->estimate   = 0;
         c->sent       = 0;
+        c->pending    = 0;
+        c->write_timeout_reported = false;
         //Stagger connects 1 msec apart within thread
         uint64_t id = thread->tid * thread->connections + i;
         aeCreateTimeEvent(loop, i, delayed_initial_connect, c, NULL);
@@ -433,6 +601,10 @@ void *thread_main(void *arg) {
 
     aeCreateTimeEvent(loop, calibrate_delay, calibrate, thread, NULL);
     aeCreateTimeEvent(loop, timeout_delay, check_timeouts, thread, NULL);
+    // we report attempted requests every second
+    if (thread->tid == 0) {
+        aeCreateTimeEvent(loop, 1000, report_attempted_requests, thread, NULL);
+    }
 
     thread->start = time_us();
     /*aeMain does the job of processing the event loop that is initialized in the previous phase.*/
@@ -479,6 +651,13 @@ static int connect_socket(thread *thread, connection *c) {
 }
 
 static int reconnect_socket(thread *thread, connection *c) {
+    uint64_t outstanding = c->sent >= c->complete ? (c->sent - c->complete) : 0;
+    if (outstanding > thread->in_flight) {
+        thread->in_flight = 0;
+    } else {
+        thread->in_flight -= outstanding;
+    }
+    c->write_timeout_reported = false;
     aeDeleteFileEvent(thread->loop, c->fd, AE_WRITABLE | AE_READABLE);
     sock.close(c);
     close(c->fd);
@@ -533,6 +712,10 @@ static int check_timeouts(aeEventLoop *loop, long long id, void *data) {
     for (uint64_t i = 0; i < thread->connections; i++, c++) {
         if (maxAge > c->start) {
             thread->errors.timeout++;
+            if (c->pending && !c->write_timeout_reported) {
+                thread->write_timeouts++;
+                c->write_timeout_reported = true;
+            }
         }
     }
 
@@ -558,6 +741,31 @@ static int sample_rate(aeEventLoop *loop, long long id, void *data) {
     thread->requests = 0;
     thread->start    = time_us();
     return thread->interval; // call sample_rate again after thread->interval
+}
+
+static int report_attempted_requests(aeEventLoop *loop, long long id, void *data) {
+    FILE *f = attempted_requests_file;
+    if (f == NULL) {
+        fprintf(stderr, "Attempted-requests log file is unavailable: %s\n",
+                attempted_requests_filename);
+        return AE_NOMORE;
+    }
+
+    thread *thread = data;
+    uint64_t now = time_us();
+    if (stop || now >= thread->stop_at) {
+        return AE_NOMORE;
+    }
+
+    // taking the global cumulative sum of thread->attempted across all threads
+    uint64_t attempted = 0;
+    for (uint64_t i = 0; i < all_num_threads; i++) {
+        attempted += __atomic_load_n(&all_threads[i].attempted, __ATOMIC_RELAXED);
+    }
+    // printf("Attempted requests sent: %" PRIu64 "\n", attempted);
+    fprintf(f, "%" PRIu64 ",%" PRIu64 "\n", now, attempted);
+    fflush(f);
+    return 1000;
 }
 
 static int header_field(http_parser *parser, const char *at, size_t len) {
@@ -684,8 +892,11 @@ static int response_complete(http_parser *parser) {
     uint64_t now = time_us();
     int status = parser->status_code;
 
-    thread->complete++;
+    thread->complete++; // request completed end-to-end
     thread->requests++;
+    if (thread->in_flight > 0) {
+        thread->in_flight--;
+    }
 
     if (status > 399) {
         thread->errors.status++;
@@ -750,6 +961,7 @@ static void socket_connected(aeEventLoop *loop, int fd, void *data, int mask) {
 
     http_parser_init(&c->parser, HTTP_RESPONSE);
     c->written = 0;
+    c->pending = 0;
 
     aeCreateFileEvent(c->thread->loop, fd, AE_READABLE, socket_readable, c);
 
@@ -782,6 +994,11 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     if (!c->written && cfg.dynamic) {
         script_request(thread->L, &c->request, &c->length);
     }
+    // increment attempted requests when connection is about to start writing a new request, specifically, before the request body is actually fully written to the socket
+    if (!c->written && !c->pending) {
+        c->pending = 1;
+        __sync_fetch_and_add(&thread->attempted, 1);
+    }
     // buf: indicates the pos. where the request remaining to send is.
     char  *buf = c->request + c->written;
     // len: the length of request that haven't been sent.
@@ -793,13 +1010,26 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
         case RETRY: return;
     }
     if (!c->written) {
-        c->start = time_us();
+        uint64_t now = time_us();
+
+        // if current is greater than when we scheduled the send, delay is positive, else 0
+        uint64_t send_delay = now > c->thread_next ? now - c->thread_next : 0;
+        hdr_record_value(thread->send_delay_histogram, send_delay); // add it to the histogram for tracking
+        c->start = now;
         c->actual_latency_start[c->sent & MAXO] = c->start;
+        c->write_timeout_reported = false;  
         c->sent ++;
+        thread->in_flight++;
+        if (thread->in_flight > thread->peak_in_flight) {
+            thread->peak_in_flight = thread->in_flight;
+        }
     }
     c->written += n;
     if (c->written == c->length) {
         c->written = 0;
+        c->pending = 0;
+        c->write_timeout_reported = false;
+        // requests fully written to the socket are counted as sent requests, so we increment c->sent here
         c->thread->sent ++;
 
         aeDeleteFileEvent(loop, fd, AE_WRITABLE);
@@ -808,6 +1038,7 @@ static void socket_writeable(aeEventLoop *loop, int fd, void *data, int mask) {
     return;
 
   error:
+    c->pending = 0;
     thread->errors.write++;
     reconnect_socket(thread, c);
 }
@@ -868,6 +1099,7 @@ static struct option longopts[] = {
     { "version",        no_argument,       NULL, 'v' },
     { "rate",           required_argument, NULL, 'R' },
     { "dist",           required_argument, NULL, 'D' },
+    { "csv",            no_argument,       NULL, 'C' },
     { NULL,             0,                 NULL,  0  }
 };
 
@@ -889,11 +1121,12 @@ static int parse_args(struct config *cfg, char ***urls, struct http_parser_url *
     cfg->record_all_responses = true;
     cfg->print_all_responses = false;
     cfg->print_realtime_latency = false;
+    cfg->save_csv_metrics = false;
     cfg->print_separate_histograms = false;
     cfg->print_sent_requests = false;
     cfg->dist = 0;
 
-    while ((c = getopt_long(argc, argv, "t:c:s:d:D:H:T:R:LPrSpBv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:s:d:D:H:T:R:LPrSpBCv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -925,6 +1158,9 @@ static int parse_args(struct config *cfg, char ***urls, struct http_parser_url *
                 break;
             case 'p': /* Shuang: print avg latency every 0.2s */
                 cfg->print_realtime_latency = true;
+                break;
+            case 'C':
+                cfg->save_csv_metrics = true;
                 break;
             case 'L':
                 cfg->latency = true;

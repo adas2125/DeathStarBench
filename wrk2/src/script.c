@@ -7,6 +7,10 @@
 #include "stats.h"
 #include "zmalloc.h"
 
+#ifndef WRK_LUA_PATH
+#define WRK_LUA_PATH "src/wrk.lua"
+#endif
+
 typedef struct {
     char *name;
     int   type;
@@ -47,7 +51,21 @@ static const luaL_Reg threadlib[] = {
 lua_State *script_create(char *file, char *url, char **headers) {
     lua_State *L = luaL_newstate();
     luaL_openlibs(L);
-    (void) luaL_dostring(L, "wrk = require \"wrk\"");
+    if (luaL_dostring(L, "local ok,m=pcall(require,'wrk'); if ok then wrk=m end; return ok")) {
+        fprintf(stderr, "unable to initialize wrk Lua loader: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    } else {
+        int has_builtin_module = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+        if (!has_builtin_module) {
+            if (luaL_dofile(L, WRK_LUA_PATH) || !lua_istable(L, -1)) {
+                fprintf(stderr, "unable to load wrk Lua module from %s: %s\n", WRK_LUA_PATH, lua_tostring(L, -1));
+                lua_pop(L, 1);
+            } else {
+                lua_setglobal(L, "wrk");
+            }
+        }
+    }
 
     luaL_newmetatable(L, "wrk.addr");
     luaL_register(L, NULL, addrlib);

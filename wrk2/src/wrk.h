@@ -40,16 +40,21 @@ typedef struct {
     uint64_t stop_at;
     uint64_t complete;
     uint64_t sent;
+    uint64_t attempted;         // total requests attempted
     uint64_t requests;
     uint64_t monitored;
     uint64_t target;
     uint64_t accum_latency;
+    uint64_t in_flight;         // for in-flight requests
+    uint64_t peak_in_flight;    // for peak in flight
+    uint64_t write_timeouts;    // for write timeouts
     uint64_t bytes;
     uint64_t start;
     double throughput;
     uint64_t mean;
     struct hdr_histogram *latency_histogram;
     struct hdr_histogram *real_latency_histogram;
+    struct hdr_histogram *send_delay_histogram; // added for the send delay histogram
     tinymt64_t rand;
     lua_State *L;
     errors errors;
@@ -87,6 +92,7 @@ typedef struct connection {
     buffer body;
     char buf[RECVBUF];
     uint64_t actual_latency_start[MAXO+1];
+    bool write_timeout_reported;
     // Internal tracking numbers (used purely for debugging):
 } connection;
 
